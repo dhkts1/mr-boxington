@@ -758,6 +758,12 @@ fn render_argument(argument: &Argument) -> Result<OsString, BypassReason> {
             format!("--codegen=link-arg=-Wl,-install_name,@rpath/{name}")
         }
         Argument::FuseLd(selection) => format!("--codegen=link-arg=-fuse-ld={selection}"),
+        Argument::DriverPrefix(directory) => format!(
+            "--codegen=link-arg=-B{}",
+            directory
+                .to_str()
+                .ok_or_else(|| BypassReason::NonUtf8Path(directory.clone()))?
+        ),
     };
     Ok(rendered.into())
 }

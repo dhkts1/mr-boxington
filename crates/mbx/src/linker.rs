@@ -116,12 +116,21 @@ fn file_probes() -> FileProbes {
 /// selector: which `ld.<name>` a driver invokes depends on its own search
 /// path, COMPILER_PATH, and PATH, so a key holding only `mold` could stand
 /// for two different linkers.
+///
+/// `prefix` is a `-B<dir>` the adapter modeled for a native link. The driver
+/// searches it first for the linker and the startup objects, so every probe
+/// asks the driver with it, the directory joins the memoization key, and the
+/// linker it selects is hashed into the identity.
 pub(crate) fn identity_for(
     override_linker: Option<&Path>,
     fuse_ld: Option<&str>,
+    prefix: Option<&Path>,
 ) -> Result<LinkerIdentity> {
     if fuse_ld.is_some() && cfg!(windows) {
         bail!("a `-fuse-ld` selection with a Windows linker is not one mbx can identify");
+    }
+    if prefix.is_some() && cfg!(windows) {
+        bail!("a `-B` prefix with a Windows linker is not one mbx can identify");
     }
     let driver = if let Some(linker) = override_linker {
         let name = linker
@@ -173,13 +182,19 @@ pub(crate) fn identity_for(
                 if cfg!(windows) {
                     None
                 } else {
-                    search_dirs(&driver)
+                    search_dirs(&driver, prefix)
                 }
             })
             .as_ref()
     };
+    if let Some(directory) = prefix {
+        environment.insert(
+            "MBX_DRIVER_PREFIX".into(),
+            Some(working_directory_key(directory)),
+        );
+    }
     let fuse_ld = fuse_ld
-        .map(|selection| resolve_fuse_ld(&driver, selection, search()))
+        .map(|selection| resolve_fuse_ld(&driver, prefix, selection, search()))
         .transpose()?;
     if let Some(located) = &fuse_ld {
         environment.insert(
@@ -190,7 +205,7 @@ pub(crate) fn identity_for(
     if let Some(cached) = find_recorded(&driver, &environment)? {
         return Ok(cached);
     }
-    let (identity, pins) = probe(&driver, fuse_ld.as_ref(), search())?;
+    let (identity, pins) = probe(&driver, prefix, fuse_ld.as_ref(), search())?;
     record(&driver, &environment, &identity, pins)?;
     Ok(identity)
 }
@@ -245,12 +260,14 @@ struct SearchDirs {
     libraries: Vec<PathBuf>,
 }
 
-fn search_dirs(driver: &Path) -> Option<SearchDirs> {
+fn search_dirs(driver: &Path, prefix: Option<&Path>) -> Option<SearchDirs> {
     // The field names are translated strings in GCC, so the question is
     // asked in the C locale, and an answer without both lists is no map:
     // a driver that accepts the flag but prints something else would
-    // otherwise pass for one that searched nowhere.
+    // otherwise pass for one that searched nowhere. A `-B` prefix is passed
+    // too, because GCC lists it first among the directories it searches.
     let output = Command::new(driver)
+        .args(prefix.map(prefix_flag))
         .arg("-print-search-dirs")
         .env("LC_ALL", "C")
         .env("LANGUAGE", "C")
@@ -479,8 +496,13 @@ fn record(
 /// names, and the objects it places, each described as the probe reads it.
 /// A platform whose identity comes from tools rather than files -- a Windows
 /// toolset, a macOS SDK -- pins nothing and is probed every session.
+///
+/// `prefix` is a `-B` directory the link hands the driver. Every question is
+/// asked with it, so the linker and objects described are the ones that link
+/// will use, and the linker it selects is hashed as well as asked its version.
 fn probe(
     driver: &Path,
+    prefix: Option<&Path>,
     fuse_ld: Option<&Located>,
     search: Option<&SearchDirs>,
 ) -> Result<(LinkerIdentity, Vec<PinnedFile>)> {
@@ -489,9 +511,15 @@ fn probe(
     }
     let mut pins = Pins::default();
     pins.add(driver);
-    let (linker_version, linker) = linker_version(driver, fuse_ld, search)?;
-    pins.extend(linker);
-    let (crt_objects, objects) = crt_objects(driver, search)?;
+    let (linker_version, linker) = linker_version(driver, prefix, fuse_ld, search)?;
+    let linker_digest = prefix
+        .map(|_| {
+            CacheDigest::blake3_file(&linker.path)
+                .wrap_err_with(|| format!("failed to hash the linker {}", linker.path.display()))
+        })
+        .transpose()?;
+    pins.extend(linker.pins);
+    let (crt_objects, objects) = crt_objects(driver, prefix, search)?;
     pins.extend(objects);
     let sdk = sdk_identity()?;
     let pins = if sdk.is_some() {
@@ -504,8 +532,9 @@ fn probe(
             .to_str()
             .ok_or_else(|| eyre::eyre!("the linker driver path is not valid UTF-8"))?
             .to_owned(),
-        driver_version: run(driver, &["--version"])?,
+        driver_version: run_driver(driver, prefix, &["--version"])?,
         linker_version,
+        linker_digest,
         crt_objects,
         sdk,
         deployment_target: std::env::var("MACOSX_DEPLOYMENT_TARGET").ok(),
@@ -545,6 +574,7 @@ fn probe_windows(linker: &Path) -> Result<LinkerIdentity> {
             .to_owned(),
         driver_version: compiler_version,
         linker_version,
+        linker_digest: None,
         crt_objects,
         sdk: Some(sdk),
         deployment_target: None,
@@ -772,13 +802,18 @@ fn windows_crt_objects_in(directories: &[PathBuf]) -> Result<BTreeMap<String, Ca
 /// will invoke. The driver answers from its own search path first, which
 /// covers COMPILER_PATH and toolchain-internal linkers; a name it does not
 /// know falls back to PATH. An absolute selection names the linker directly.
-fn resolve_fuse_ld(driver: &Path, selection: &str, search: Option<&SearchDirs>) -> Result<Located> {
+fn resolve_fuse_ld(
+    driver: &Path,
+    prefix: Option<&Path>,
+    selection: &str,
+    search: Option<&SearchDirs>,
+) -> Result<Located> {
     if Path::new(selection).is_absolute() {
         return Ok(Located::named(PathBuf::from(selection)));
     }
     let name = format!("ld.{selection}");
     let argument = format!("-print-prog-name={name}");
-    let printed = run(driver, &[argument.as_str()])
+    let printed = run_driver(driver, prefix, &[argument.as_str()])
         .wrap_err_with(|| format!("the linker driver named nothing for `{name}`"))?;
     let candidate = PathBuf::from(&printed);
     let printed = if candidate.is_absolute() && candidate.exists() {
@@ -801,9 +836,10 @@ fn resolve_fuse_ld(driver: &Path, selection: &str, search: Option<&SearchDirs>) 
 /// emulations that say nothing about the version.
 fn linker_version(
     driver: &Path,
+    prefix: Option<&Path>,
     fuse_ld: Option<&Located>,
     search: Option<&SearchDirs>,
-) -> Result<(String, Pins)> {
+) -> Result<(String, Located)> {
     if let Some(located) = fuse_ld {
         let program = located.path.as_path();
         // Already resolved to the binary the driver invokes; pin both its
@@ -826,7 +862,10 @@ fn linker_version(
         }
         return Ok((
             format!("{}: {version}", program.display()),
-            located.pins.clone(),
+            Located {
+                path: located.path.clone(),
+                pins: located.pins.clone(),
+            },
         ));
     }
     // Asked of the driver rather than resolved from PATH: the `ld` a shell
@@ -835,7 +874,8 @@ fn linker_version(
     // answers with a bare name is saying it would search PATH itself, so
     // the same search here names the file it would run.
     let named = PathBuf::from(
-        run(driver, &["-print-prog-name=ld"]).wrap_err("the linker driver named no linker")?,
+        run_driver(driver, prefix, &["-print-prog-name=ld"])
+            .wrap_err("the linker driver named no linker")?,
     );
     let located = Located::program(OsStr::new("ld"), &named, search)
         .wrap_err_with(|| format!("failed to find the linker `{}`", named.display()))?;
@@ -854,7 +894,7 @@ fn linker_version(
     if version.is_empty() {
         bail!("{} reported no version", linker.display());
     }
-    Ok((version.to_owned(), located.pins))
+    Ok((version.to_owned(), located))
 }
 
 /// Hash the startup objects and libc the driver resolves.
@@ -867,11 +907,12 @@ fn linker_version(
 /// does gets no identity and no cached link.
 fn crt_objects(
     driver: &Path,
+    prefix: Option<&Path>,
     search: Option<&SearchDirs>,
 ) -> Result<(BTreeMap<String, CacheDigest>, Pins)> {
     let placed = std::cell::RefCell::new(Pins::default());
     let objects = probe_files(&file_probes(), |name| {
-        let resolved = run(driver, &[&format!("-print-file-name={name}")]).ok()?;
+        let resolved = run_driver(driver, prefix, &[&format!("-print-file-name={name}")]).ok()?;
         let path = PathBuf::from(resolved.trim());
         // The driver echoes the name back when it cannot place it.
         if !path.is_absolute() {
@@ -961,7 +1002,26 @@ fn xcrun(arguments: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn run(program: &Path, arguments: &[&str]) -> Result<String> {
+/// The `-B<dir>` argument for a driver prefix, kept in OS bytes.
+fn prefix_flag(directory: &Path) -> std::ffi::OsString {
+    let mut flag = std::ffi::OsString::from("-B");
+    flag.push(directory);
+    flag
+}
+
+/// Ask the driver a question with the `-B` prefix the link hands it, so the
+/// answer is the one that link gets.
+fn run_driver(driver: &Path, prefix: Option<&Path>, arguments: &[&str]) -> Result<String> {
+    let prefix = prefix.map(prefix_flag);
+    let arguments = prefix
+        .iter()
+        .map(|flag| flag.as_os_str())
+        .chain(arguments.iter().map(OsStr::new))
+        .collect::<Vec<_>>();
+    run(driver, &arguments)
+}
+
+fn run<A: AsRef<OsStr> + std::fmt::Debug>(program: &Path, arguments: &[A]) -> Result<String> {
     let output = Command::new(program)
         .args(arguments)
         .output()

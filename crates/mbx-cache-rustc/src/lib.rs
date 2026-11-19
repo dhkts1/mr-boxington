@@ -384,6 +384,13 @@ enum Argument {
     /// link invokes. Modeled for native links only, where the linker identity
     /// probe resolves and pins the linker it names.
     FuseLd(String),
+    /// A `-B<absolute dir>` handed to a Unix driver, adding a directory the
+    /// driver searches first for the programs and objects a link uses: the
+    /// linker itself, and the startup objects. Modeled for native links
+    /// only, where the linker identity probe runs the driver with the same
+    /// prefix and so resolves, hashes, and pins what it selects. The path is
+    /// a host location, so it enters the key as written.
+    DriverPrefix(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,6 +559,18 @@ impl RustcInvocation {
                 return None;
             };
             Some(selection.as_str())
+        })
+    }
+
+    /// Directory selected with `-C link-arg=-B<dir>`, if the invocation passes
+    /// one the adapter models. The linker identity probe asks the driver with
+    /// the same prefix, so what it selects is what the key describes.
+    pub fn driver_prefix(&self) -> Option<&Path> {
+        self.arguments.iter().find_map(|argument| {
+            let Argument::DriverPrefix(directory) = argument else {
+                return None;
+            };
+            Some(directory.as_path())
         })
     }
 
@@ -1024,6 +1043,12 @@ pub struct LinkerIdentity {
     pub driver_version: String,
     /// Version of the linker the driver selects.
     pub linker_version: String,
+    /// Content of the linker the driver selects, where a `-B` prefix chose
+    /// it. A linker in such a directory is often a build of a project's own
+    /// (a `wild` or `mold` checked into its CI tools), which a rebuild changes
+    /// without changing the version line above.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub linker_digest: Option<CacheDigest>,
     /// Startup objects and libc the driver resolves, by probe name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub crt_objects: BTreeMap<String, CacheDigest>,
@@ -1808,6 +1833,28 @@ impl<'a> Parser<'a> {
             }
             return Ok(());
         }
+        // `-B<dir>` adds a directory the driver searches first for the
+        // linker and the startup objects. Parsed rather than keyed as text so
+        // the linker identity probe can ask the driver with the same prefix.
+        // Only one absolute directory is modeled: a repeat of it dedups, and
+        // a relative one or a second, different directory falls through to
+        // Plain, which a link declines to model.
+        if name == "link-arg"
+            && let Some((_, option)) = value.split_once('=')
+            && let Some(directory) = option.strip_prefix("-B")
+            && Path::new(directory).is_absolute()
+            && !self.parsed.iter().any(|argument| {
+                matches!(argument, Argument::DriverPrefix(existing) if existing != Path::new(directory))
+            })
+        {
+            if !self.parsed.iter().any(|argument| {
+                matches!(argument, Argument::DriverPrefix(existing) if existing == Path::new(directory))
+            }) {
+                self.parsed
+                    .push(Argument::DriverPrefix(PathBuf::from(directory)));
+            }
+            return Ok(());
+        }
         // Only a single filename under @rpath is modeled. Other spellings,
         // combined linker options, and explicit absolute names still bypass.
         if name == "link-arg"
@@ -2143,6 +2190,29 @@ impl<'a> Parser<'a> {
                 "link-arg=-Wl,-oso_prefix".into(),
             ));
         }
+        // `-B` is a GCC and Clang driver option. Only a native Unix link
+        // runs such a driver under the identity probe that resolves what the
+        // prefix selects; anywhere else nothing describes it. Where nothing
+        // links the prefix is inert and the key carries its text.
+        if let Some(directory) = self.parsed.iter().find_map(|argument| {
+            let Argument::DriverPrefix(directory) = argument else {
+                return None;
+            };
+            Some(directory)
+        }) && link_output != LinkOutput::Library
+            && (cfg!(windows)
+                || !matches!(
+                    link_output,
+                    LinkOutput::NativeExecutable
+                        | LinkOutput::NativeProcMacro
+                        | LinkOutput::NativeSharedLibrary
+                ))
+        {
+            return Err(BypassReason::UnmodeledLinkArgument(format!(
+                "link-arg=-B{}",
+                directory.display()
+            )));
+        }
         if let Some(name) = self.parsed.iter().find_map(|argument| match argument {
             Argument::Extern { name, path: None } if name != "proc_macro" => Some(name),
             _ => None,
@@ -2179,6 +2249,7 @@ impl Parser<'_> {
             let (name, value) = option.split_once('=').unwrap_or((option, ""));
             (matches!(name, "link-arg" | "link-args")
                 && !(name == "link-arg" && elf_keyword_is_modeled(link_output, value))
+                && !(name == "link-arg" && macos_rpath_is_modeled(link_output, value))
                 && !msvc_options_are_modeled(link_output, name, value))
             .then_some(option)
         })
@@ -2358,6 +2429,33 @@ fn elf_keyword_is_modeled(link_output: LinkOutput, value: &str) -> bool {
                     | "relro"
             )
         })
+}
+
+/// A single `-Wl,-rpath,<absolute dir>` on a native macOS link.
+///
+/// ld64 only records the directory as an `LC_RPATH` load command in the
+/// output; it never searches it while linking. So the argument's text is the
+/// whole input, and keying it as text is exact: the same directory gives the
+/// same bytes, and another directory gives another key. The directory is
+/// kept verbatim rather than normalized, because the linked program embeds
+/// that exact spelling.
+///
+/// Everything else still bypasses: a relative or `@`-prefixed entry (whose
+/// meaning depends on where the program or loader sits), several options in
+/// one argument, the plural `link-args`, and every other host. GNU ld also
+/// searches `-rpath` directories for the libraries a linked shared object
+/// needs, so on Linux the directory's contents could change the link.
+fn macos_rpath_is_modeled(link_output: LinkOutput, value: &str) -> bool {
+    cfg!(target_os = "macos")
+        && matches!(
+            link_output,
+            LinkOutput::NativeExecutable
+                | LinkOutput::NativeProcMacro
+                | LinkOutput::NativeSharedLibrary
+        )
+        && value
+            .strip_prefix("-Wl,-rpath,")
+            .is_some_and(|directory| directory.starts_with('/') && !directory.contains(','))
 }
 
 /// `-C link-arg` / `-C link-args` values that `link.exe` and `lld-link` read
@@ -2623,6 +2721,14 @@ impl<'a> ActionBuilder<'a> {
                 if *trailing_slash { "/" } else { "" }
             )),
             Argument::FuseLd(selection) => Ok(format!("--codegen=link-arg=-fuse-ld={selection}")),
+            // A host location, like the linker identity's own paths, so it is
+            // never placeholder-mapped: two hosts whose prefixes differ miss.
+            Argument::DriverPrefix(directory) => Ok(format!(
+                "--codegen=link-arg=-B{}",
+                directory
+                    .to_str()
+                    .ok_or_else(|| BypassReason::NonUtf8Path(directory.clone()))?
+            )),
         }
     }
 
