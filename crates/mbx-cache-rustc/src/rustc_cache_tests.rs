@@ -2653,6 +2653,7 @@ fn test_linker() -> LinkerIdentity {
         driver: "/usr/bin/cc".into(),
         driver_version: "Apple clang version 17.0.0".into(),
         linker_version: "ld64-1200".into(),
+        linker_digest: None,
         crt_objects: BTreeMap::new(),
         sdk: Some("MacOSX15.0.sdk (24A335)".into()),
         deployment_target: None,
@@ -2684,6 +2685,17 @@ fn the_linker_identity_changes_the_action_key() {
         keyed(test_linker()),
         keyed(LinkerIdentity {
             driver_version: "Apple clang version 18.0.0".into(),
+            ..test_linker()
+        })
+    );
+    // A linker rebuilt under the same version line is another linker.
+    assert_ne!(
+        keyed(LinkerIdentity {
+            linker_digest: Some(CacheDigest::blake3(b"wild, one build")),
+            ..test_linker()
+        }),
+        keyed(LinkerIdentity {
+            linker_digest: Some(CacheDigest::blake3(b"wild, another build")),
             ..test_linker()
         })
     );
@@ -3215,6 +3227,175 @@ fn elf_keywords_are_keyed_on_a_native_linux_link() {
             "link-arg=-Wl,-z,nodelete".into()
         ))
     );
+}
+
+/// A build script printing `cargo:rustc-link-arg=-Wl,-rpath,<dir>` so test
+/// binaries find a prebuilt dylib reaches every test link in the crate. ld64
+/// only records the directory in the output, so a native macOS link keeps an
+/// absolute one in its key verbatim. Any other spelling still bypasses.
+#[test]
+fn an_absolute_rpath_is_keyed_on_a_native_macos_link() {
+    let link = |flag: &str| {
+        args(&[
+            "--crate-name=widget",
+            "--test",
+            "--emit=dep-info,link",
+            "--out-dir=target/debug/deps",
+            flag,
+            "src/lib.rs",
+        ])
+    };
+    let rpath = "-Clink-arg=-Wl,-rpath,/opt/vendor/lib";
+    let parsed = RustcInvocation::parse_with(&link(rpath), native_links());
+    if !cfg!(target_os = "macos") {
+        // GNU ld searches `-rpath` for the libraries a shared object needs,
+        // so elsewhere the directory may change the link.
+        assert_eq!(
+            parsed,
+            Err(BypassReason::UnmodeledLinkArgument(
+                "link-arg=-Wl,-rpath".into()
+            ))
+        );
+        return;
+    }
+    assert!(parsed.unwrap().links_natively());
+
+    let key = |flag: &str| {
+        let RustcAction { bytes, .. } = RustcInvocation::parse_with(&link(flag), native_links())
+            .unwrap()
+            .action_linked_by(context(&[("src/lib.rs", "source")]), Some(test_linker()))
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    };
+    let json = key(rpath);
+    assert!(
+        json.contains(r#""--codegen=link-arg=-Wl,-rpath,/opt/vendor/lib""#),
+        "the directory must enter the key as written: {json}"
+    );
+    assert_ne!(
+        json,
+        key("-Clink-arg=-Wl,-rpath,/opt/other/lib"),
+        "another directory is another program"
+    );
+
+    for flag in [
+        "-Clink-arg=-Wl,-rpath,vendor/lib",
+        "-Clink-arg=-Wl,-rpath,@loader_path/../lib",
+        "-Clink-arg=-Wl,-rpath,@executable_path",
+        "-Clink-arg=-Wl,-rpath,/opt/a,-rpath,/opt/b",
+        "-Clink-arg=-Wl,-rpath,",
+        "-Clink-arg=-Wl,-rpath=/opt/vendor/lib",
+        "-Clink-args=-Wl,-rpath,/opt/vendor/lib",
+    ] {
+        assert_eq!(
+            RustcInvocation::parse_with(&link(flag), native_links()),
+            Err(BypassReason::UnmodeledLinkArgument(
+                flag.strip_prefix("-C").unwrap().into()
+            )),
+            "{flag} should not be cacheable"
+        );
+    }
+    // A cross-compiled link is not native, so the directory is not modeled.
+    let mut cross = link(rpath);
+    cross.insert(0, "--target=wasm32-unknown-unknown".into());
+    assert_eq!(
+        RustcInvocation::parse_with(&cross, native_links()),
+        Err(BypassReason::UnmodeledLinkArgument(
+            "link-arg=-Wl,-rpath".into()
+        ))
+    );
+}
+
+/// A `rustflags` entry of `-C link-arg=-B/opt/ci-tools/wild` selects a
+/// project's own linker for every link. On a native Unix link the directory
+/// is parsed, enters the key as written, and is handed to the linker identity
+/// probe, which resolves and hashes the linker it selects. A relative
+/// directory, a second different one, and any link no probe describes still
+/// bypass.
+#[test]
+fn a_driver_prefix_is_modeled_for_native_unix_links() {
+    let link = |flags: &[&str]| {
+        let mut arguments = vec![
+            "--crate-name=widget",
+            "--test",
+            "--emit=dep-info,link",
+            "--out-dir=target/debug/deps",
+        ];
+        arguments.extend_from_slice(flags);
+        arguments.push("src/lib.rs");
+        args(&arguments)
+    };
+    let prefix = "-Clink-arg=-B/opt/ci-tools/wild";
+    let parsed = RustcInvocation::parse_with(&link(&[prefix]), native_links());
+    if cfg!(windows) {
+        assert_eq!(
+            parsed,
+            Err(BypassReason::UnmodeledLinkArgument(
+                "link-arg=-B/opt/ci-tools/wild".into()
+            ))
+        );
+        return;
+    }
+    let invocation = parsed.expect("a `-B` prefix on a native link is cacheable");
+    assert_eq!(
+        invocation.driver_prefix(),
+        Some(Path::new("/opt/ci-tools/wild"))
+    );
+    let RustcAction { bytes, .. } = invocation
+        .action_linked_by(context(&[("src/lib.rs", "source")]), Some(test_linker()))
+        .unwrap();
+    let json = String::from_utf8(bytes).unwrap();
+    assert!(
+        json.contains(r#""--codegen=link-arg=-B/opt/ci-tools/wild""#),
+        "the directory must enter the key as written: {json}"
+    );
+    // The same directory twice is one prefix.
+    assert!(
+        RustcInvocation::parse_with(&link(&[prefix, prefix]), native_links())
+            .unwrap()
+            .driver_prefix()
+            .is_some()
+    );
+
+    for flags in [
+        &["-Clink-arg=-Bwild"][..],
+        &["-Clink-arg=-B"][..],
+        &["-Clink-args=-B/opt/ci-tools/wild"][..],
+    ] {
+        assert!(
+            matches!(
+                RustcInvocation::parse_with(&link(flags), native_links()),
+                Err(BypassReason::UnmodeledLinkArgument(_))
+            ),
+            "{flags:?} should not be cacheable"
+        );
+    }
+    assert_eq!(
+        RustcInvocation::parse_with(&link(&[prefix, "-Clink-arg=-B/opt/other"]), native_links()),
+        Err(BypassReason::UnmodeledLinkArgument(
+            "link-arg=-B/opt/other".into()
+        )),
+        "a second, different prefix names no single search"
+    );
+    // A cross-compiled link runs no driver the probe describes.
+    let mut cross = link(&[prefix]);
+    cross.insert(0, "--target=wasm32-unknown-unknown".into());
+    assert_eq!(
+        RustcInvocation::parse_with(&cross, native_links()),
+        Err(BypassReason::UnmodeledLinkArgument(
+            "link-arg=-B/opt/ci-tools/wild".into()
+        ))
+    );
+    // Where nothing links, the prefix is inert and the library caches.
+    let library = args(&[
+        "--crate-name=widget",
+        "--crate-type=lib",
+        "--emit=dep-info,metadata,link",
+        "--out-dir=target/debug/deps",
+        prefix,
+        "src/lib.rs",
+    ]);
+    assert!(RustcInvocation::parse(&library).is_ok());
 }
 
 /// `-fuse-ld=<name>` is the one link argument beyond `-oso_prefix` the

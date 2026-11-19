@@ -57,6 +57,7 @@ fn the_identity_round_trips_through_its_recorded_form() {
         driver: "/usr/bin/cc".into(),
         driver_version: "cc version 14".into(),
         linker_version: "GNU ld 2.42".into(),
+        linker_digest: Some(CacheDigest::blake3(b"ld")),
         crt_objects: BTreeMap::from([("crt1.o".into(), CacheDigest::blake3(b"crt"))]),
         sdk: None,
         deployment_target: Some("11.0".into()),
@@ -73,8 +74,8 @@ fn the_identity_round_trips_through_its_recorded_form() {
 /// Probe this host without the agent round-trip the real path memoizes through.
 fn identity_without_agent() -> Result<LinkerIdentity> {
     let driver = which::which("cc")?;
-    let search = search_dirs(&driver);
-    probe(&driver, None, search.as_ref()).map(|(identity, _)| identity)
+    let search = search_dirs(&driver, None);
+    probe(&driver, None, None, search.as_ref()).map(|(identity, _)| identity)
 }
 
 #[test]
@@ -372,8 +373,8 @@ fn an_undescribable_file_unpins_without_failing() {
 #[cfg(target_os = "linux")]
 fn a_probe_pins_the_files_it_read() {
     let driver = which::which("cc").unwrap();
-    let search = search_dirs(&driver).expect("the driver reports its search directories");
-    let (identity, pins) = probe(&driver, None, Some(&search)).unwrap();
+    let search = search_dirs(&driver, None).expect("the driver reports its search directories");
+    let (identity, pins) = probe(&driver, None, None, Some(&search)).unwrap();
     assert!(pins.iter().all(|pin| pin.path.is_absolute()), "{pins:?}");
     assert!(pins.iter().all(PinnedFile::holds), "{pins:?}");
     let present = pins.iter().filter(|pin| pin.state.is_some()).count();
@@ -401,8 +402,9 @@ fn a_fuse_ld_selection_resolves_or_is_refused() {
 
     let bogus = resolve_fuse_ld(
         &driver,
+        None,
         "definitely-not-a-real-linker",
-        search_dirs(&driver).as_ref(),
+        search_dirs(&driver, None).as_ref(),
     );
     assert!(
         bogus.is_err(),
@@ -414,8 +416,9 @@ fn a_fuse_ld_selection_resolves_or_is_refused() {
     assert_eq!(
         resolve_fuse_ld(
             &driver,
+            None,
             direct.to_str().unwrap(),
-            search_dirs(&driver).as_ref()
+            search_dirs(&driver, None).as_ref()
         )
         .unwrap()
         .path,
@@ -425,7 +428,9 @@ fn a_fuse_ld_selection_resolves_or_is_refused() {
     // Whatever the host does provide resolves to an absolute path that
     // exists: anything less could alias two linkers in one memoization key.
     for name in ["mold", "lld", "bfd", "gold"] {
-        if let Ok(located) = resolve_fuse_ld(&driver, name, search_dirs(&driver).as_ref()) {
+        if let Ok(located) =
+            resolve_fuse_ld(&driver, None, name, search_dirs(&driver, None).as_ref())
+        {
             let program = &located.path;
             assert!(
                 program.is_absolute() && program.exists(),
@@ -436,6 +441,66 @@ fn a_fuse_ld_selection_resolves_or_is_refused() {
             assert_eq!(pins.last().map(|pin| &pin.path), Some(program));
         }
     }
+}
+
+/// A `-B<dir>` holding the project's own linker, as a project passes
+/// `-B/opt/ci-tools/wild`, selects the `ld` in that directory. The probe
+/// asks the driver with the same prefix, so it describes that linker, and it
+/// hashes the file: a rebuild that keeps the version line still changes the
+/// identity, and with it the key.
+#[cfg(unix)]
+#[test]
+fn a_driver_prefix_selects_and_hashes_the_linker_in_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(driver) = which::which("cc") else {
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let prefix = directory.path();
+    let linker = prefix.join("ld");
+    let write_linker = |build: &str| {
+        std::fs::write(
+            &linker,
+            format!(
+                "#!/bin/sh\n# {build}\necho 'Wild version 0.6.0 (compatible with GNU linkers)'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&linker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let probed = || {
+        let search = search_dirs(&driver, Some(prefix));
+        probe(&driver, Some(prefix), None, search.as_ref()).unwrap()
+    };
+
+    write_linker("one build");
+    let (first, pins) = probed();
+    assert_eq!(
+        first.linker_version, "Wild version 0.6.0 (compatible with GNU linkers)",
+        "the probe must ask the linker in the prefix: {first:?}"
+    );
+    assert_eq!(
+        first.linker_digest,
+        Some(CacheDigest::blake3_file(&linker).unwrap())
+    );
+    if !cfg!(target_os = "macos") {
+        // Where the identity is pinned at all, the linker in the prefix is.
+        assert!(pins.iter().any(|pin| pin.path == linker), "{pins:?}");
+    }
+
+    write_linker("another build");
+    let (second, _) = probed();
+    assert_eq!(second.linker_version, first.linker_version);
+    assert_ne!(
+        second.linker_digest, first.linker_digest,
+        "a rebuilt linker with the same version must be another identity"
+    );
+
+    // Without the prefix nothing is hashed, so every identity recorded
+    // before this field existed keeps its key.
+    let search = search_dirs(&driver, None);
+    let (plain, _) = probe(&driver, None, None, search.as_ref()).unwrap();
+    assert_eq!(plain.linker_digest, None);
 }
 
 /// The probe names are platform knowledge, but the rule about them is not:
@@ -567,7 +632,7 @@ fn relative_linker_searches_key_the_identity_by_working_directory() {
 
     const CHILD: &str = "MBX_TEST_LINKER_DIRECTORY_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        assert!(identity_for(None, None).is_err());
+        assert!(identity_for(None, None, None).is_err());
         return;
     }
     if which::which("cc").is_err() {
